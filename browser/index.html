@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Real Device Hub</title>
+  <script src="/vendor/draggabilly.pkgd.js"></script>
+  <script src="/vendor/packery.pkgd.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0d0d0d;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      min-height: 100vh;
+    }
+    header {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 18px;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+      position: sticky; top: 0;
+      background: rgba(13,13,13,0.85);
+      backdrop-filter: blur(8px);
+      z-index: 20;
+    }
+    header h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.3px; }
+    #count, #hint { font-size: 13px; color: #777; }
+    #unsupported { font-size: 13px; color: #ff9f0a; }
+
+    #grid { margin: 16px; }
+    #empty { color: #666; text-align: center; margin: 80px auto; font-size: 14px; }
+
+    .tile {
+      position: absolute;
+      background: #161616;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      user-select: none;
+      -webkit-user-select: none;
+      transition: box-shadow 0.15s;
+    }
+    /* Packery's own drag helper: it sizes and positions the element, so the
+       tile must not also be absolutely positioned by us. */
+    .tile.is-dragging { box-shadow: 0 18px 50px rgba(0,0,0,0.7); border-color: rgba(255,255,255,0.3); z-index: 5; }
+    .bar {
+      padding: 7px 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      display: flex; align-items: center; gap: 7px;
+      cursor: grab;
+      flex: 0 0 auto;
+    }
+    .tile.is-dragging .bar { cursor: grabbing; }
+    .tile .name { font-size: 12px; font-weight: 600; flex: 1; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tile .runtime, .tile .fps {
+      font-size: 10.5px; color: #888; font-variant-numeric: tabular-nums; white-space: nowrap;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #888; flex-shrink: 0; }
+    .dot.connecting { background: #f0a500; }
+    .dot.streaming  { background: #30d158; }
+    .dot.error      { background: #ff453a; }
+
+    /* Shown only on devices with more than one screen. */
+    .flip {
+      border: 1px solid rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.06);
+      color: #bbb;
+      border-radius: 5px;
+      font-size: 10px;
+      line-height: 1;
+      padding: 3px 5px;
+      cursor: pointer;
+      font-variant-numeric: tabular-nums;
+      flex-shrink: 0;
+    }
+    .flip:hover { background: rgba(255,255,255,0.16); color: #fff; }
+    .flip[hidden] { display: none; }
+
+    .screen { position: relative; flex: 1; min-height: 0; background: #000; display: flex; }
+    canvas { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .note {
+      position: absolute; inset: 0; padding: 12px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11.5px; color: #666; text-align: center;
+    }
+
+    /* Bottom-right grip: the tile's width only — the height follows the
+       screen's aspect ratio, so a device is never stretched. */
+    .grip {
+      position: absolute; right: 0; bottom: 0;
+      width: 22px; height: 22px;
+      cursor: nwse-resize;
+      touch-action: none;
+      opacity: 0;
+      transition: opacity 0.15s;
+      background: linear-gradient(135deg, transparent 0 52%, rgba(255,255,255,0.45) 52% 60%,
+        transparent 60% 70%, rgba(255,255,255,0.45) 70% 78%, transparent 78%);
+    }
+    .tile:hover .grip, .tile.is-dragging .grip { opacity: 1; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Real Device Hub</h1>
+    <span id="count">—</span>
+    <span id="hint">drag a tile to rearrange · drag its corner to resize</span>
+    <span id="unsupported"></span>
+  </header>
+  <div id="grid"></div>
+  <div id="empty">No booted simulators. Boot one in Xcode, or:<br><code>xcrun simctl boot &lt;udid&gt;</code></div>
+
+  <script>
+    const gridEl = document.getElementById('grid');
+    const countEl = document.getElementById('count');
+    const emptyEl = document.getElementById('empty');
+
+    const MIN_W = 150;
+    const MAX_W = 720;
+    const DEFAULT_W = 240;
+    const GAP = 16;
+    // The bar is chrome on top of the screen, so it comes off the height budget.
+    const BAR_H = 30;
+
+    const tiles = new Map();
+    let packery = null;
+
+    if (typeof VideoDecoder === 'undefined') {
+      document.getElementById('unsupported').textContent =
+        'This browser has no WebCodecs — needs Chrome 94+ / Safari 16.4+';
+    }
+
+    if (typeof Packery !== 'undefined') {
+      packery = new Packery(gridEl, {
+        itemSelector: '.tile',
+        // Tiles carry explicit pixel sizes, so Packery must position in pixels.
+        // percentPosition makes it re-derive a percentage width from the
+        // container on every layout, and the drift compounds until everything
+        // is full width and stacks in a single column.
+        percentPosition: false,
+        transitionDuration: '0.18s',
+        gap: GAP,
+        // Packery sorts by DOM order; our order array *is* the DOM order.
+        sortBy: 'domOrder',
+      });
+      packery.on('layoutComplete', () => { for (const tile of tiles.values()) tile.commitSize(); });
+    } else {
+      document.getElementById('unsupported').textContent =
+        'Could not load /vendor/packery.pkgd.js — drag and resize are disabled.';
+    }
+
+    // ─── One simulator tile ───────────────────────────────────────────────────
+    class Tile {
+      constructor(device) {
+        this.key = device.key;
+        this.width = DEFAULT_W;
+        this.aspect = 9 / 19.5;          // replaced by the reported screen size
+        this.screen = 0;                 // which of the device's screens
+        this.screens = 1;
+        this.frames = 0;
+        this.fpsWindow = [];
+        this.generation = 0;
+        this.retryDelay = 1000;
+        this.softwareDecoder = false;
+        this.codec = null;
+        this.lastFrameAt = 0;
+        this.dragging = false;
+        this.build();
+        tiles.set(this.key, this);
+        gridEl.appendChild(this.el);
+        this.sizeElement();
+        this.makeDraggable();
+        if (packery) packery.appended(this.el);
+        this.apply(device);
+      }
+
+      /// Packery 3 delegates dragging to Draggabilly; the title bar is the
+      /// handle so the flip button stays clickable. `packery.bindDraggabillyEvents`
+      /// wires the two together: it reorders the DOM on drop and re-packs.
+      makeDraggable() {
+        if (typeof Draggabilly === 'undefined' || !packery) return;
+        const drag = new Draggabilly(this.el, { handle: '.bar' });
+        this.drag = drag;
+        if (packery.bindDraggabillyEvents) packery.bindDraggabillyEvents(drag);
+        // Packery leaves the dropped item at the drop point and packs the rest
+        // around it, so on a wide page two tiles end up stacked in one column
+        // with empty space to their left. Fold the drop position into the DOM
+        // order — that is also the order Packery packs in, and the order tab
+        // and screen readers follow — then let it re-pack from the top-left.
+        drag.on('dragStart', () => { this.dragging = true; });
+        drag.on('dragEnd', () => {
+          this.dragging = false;
+          requestAnimationFrame(() => {
+            if (!packery) return;
+            const el = this.el;
+            const r = el.getBoundingClientRect();
+            const others = [...packery.element.children].filter(
+              (child) => child !== el && child.classList.contains('tile'));
+            const next = others.find((other) => {
+              const b = other.getBoundingClientRect();
+              return b.top > r.top + 1 ||
+                (Math.abs(b.top - r.top) <= 1 && b.left > r.left + 1);
+            });
+            packery.element.insertBefore(el, next || null);
+            packery.layout();
+          });
+        });
+      }
+
+      build() {
+        const el = document.createElement('div');
+        el.className = 'tile';
+        el.dataset.key = this.key;
+        el.innerHTML = `
+          <div class="bar">
+            <span class="dot connecting"></span>
+            <span class="name"></span>
+            <button class="flip" hidden title="Show the other screen">⟳</button>
+            <span class="runtime"></span>
+            <span class="fps"></span>
+          </div>
+          <div class="screen"><canvas></canvas><div class="note">connecting…</div></div>
+          <div class="grip"></div>`;
+        this.el = el;
+        this.barEl = el.querySelector('.bar');
+        this.nameEl = el.querySelector('.name');
+        this.runtimeEl = el.querySelector('.runtime');
+        this.dot = el.querySelector('.dot');
+        this.noteEl = el.querySelector('.note');
+        this.canvas = el.querySelector('canvas');
+        this.ctx = this.canvas.getContext('2d');
+        this.fpsEl = el.querySelector('.fps');
+        this.flipBtn = el.querySelector('.flip');
+        this.grip = el.querySelector('.grip');
+
+        this.flipBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+        this.flipBtn.addEventListener('click', (e) => { e.stopPropagation(); this.flip(); });
+        this.grip.addEventListener('pointerdown', (e) => this.beginResize(e));
+      }
+
+      /** Height always comes from the screen's real aspect ratio. */
+      get height() { return Math.round(this.width / this.aspect) + BAR_H; }
+
+      /** Write the size onto the element. Packery reads it on the next layout. */
+      sizeElement() {
+        this.el.style.width = this.width + 'px';
+        this.el.style.height = this.height + 'px';
+      }
+
+      /** Read back what the element actually settled on, so a user resize is
+       *  not overwritten by the next refit. */
+      commitSize() {
+        if (this.dragging) return;
+        const width = this.el.offsetWidth;
+        const height = this.el.offsetHeight;
+        if (width < MIN_W || height < BAR_H + 40) return;
+        this.width = width;
+        this.aspect = width / Math.max(1, height - BAR_H);
+      }
+
+      beginResize(e) {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.grip.setPointerCapture(e.pointerId);
+        const startX = e.clientX, startW = this.width;
+
+        const move = (ev) => {
+          this.width = Math.round(
+            Math.max(MIN_W, Math.min(MAX_W, startW + ev.clientX - startX)));
+          this.sizeElement();
+        };
+        const up = () => {
+          this.grip.removeEventListener('pointermove', move);
+          this.grip.removeEventListener('pointerup', up);
+          this.grip.removeEventListener('pointercancel', up);
+          if (packery) packery.layout();
+        };
+        this.grip.addEventListener('pointermove', move);
+        this.grip.addEventListener('pointerup', up);
+        this.grip.addEventListener('pointercancel', up);
+      }
+
+      /// Show the device's other screen. Only one screen streams at a time, so
+      /// this drops the socket and asks the server for the other window.
+      flip() {
+        if (this.screens < 2) return;
+        this.screen = (this.screen + 1) % this.screens;
+        this.updateFlipLabel();
+        this.stop('switching screen…');
+        this.frames = 0;
+        this.fpsWindow = [];
+        this.fpsEl.textContent = '';
+        this.applyAspectFromSizes();
+        this.sizeElement();
+        if (packery) packery.layout();
+        this.start();
+      }
+
+      updateFlipLabel() {
+        this.flipBtn.textContent = `⟳ ${this.screen + 1}/${this.screens}`;
+        this.flipBtn.title = this.screens > 1
+          ? `Show screen ${this.screen + 2} of ${this.screens}`
+          : 'This device has one screen';
+      }
+
+      /// Tile aspect follows the screen being shown, so the box is right before
+      /// any frame arrives. Returns true if it changed.
+      applyAspectFromSizes() {
+        const size = (this.device && this.device.sizes || [])[this.screen];
+        if (!size || !size.height) return false;
+        // Guard the ratio: a bogus measurement here would size the tile wrong.
+        const aspect = size.width / size.height;
+        if (!(aspect > 0.25 && aspect < 1.2)) return false;
+        if (Math.abs(aspect - this.aspect) < 0.005) return false;
+        this.aspect = aspect;
+        return true;
+      }
+
+      /// Server-side state changed — relabel, resize to the real aspect, and
+      /// connect or disconnect.
+      apply(device) {
+        const previous = this.device;
+        this.device = device;
+        this.nameEl.textContent = device.name;
+        this.runtimeEl.textContent = device.runtime ?? '';
+        this.screens = device.screens || 1;
+        if (this.screen >= this.screens) this.screen = 0;
+        this.flipBtn.hidden = this.screens < 2;
+        this.updateFlipLabel();
+        if (this.applyAspectFromSizes()) this.sizeElement();
+        if (device.streaming) this.start();
+        else this.stop('no Simulator window open — open it in Simulator.app');
+        return !previous ||
+          previous.streaming !== device.streaming ||
+          previous.screens !== device.screens ||
+          previous.name !== device.name ||
+          previous.runtime !== device.runtime;
+      }
+
+      // ── Stream ──────────────────────────────────────────────────────────
+      setStatus(state, text) {
+        this.dot.className = 'dot ' + state;
+        if (text === null) { this.noteEl.style.display = 'none'; return; }
+        this.noteEl.style.display = 'flex';
+        this.noteEl.textContent = text;
+      }
+
+      start() {
+        if (this.ws || this.retry) return;
+        const gen = ++this.generation;
+        // Only say "waiting" until something has painted. A reconnect should
+        // keep showing the last frame instead of flashing the note every time.
+        this.setStatus('connecting', this.frames ? null : 'waiting for first frame…');
+
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(
+          `${proto}//${location.host}/ws?udid=${encodeURIComponent(this.key)}&screen=${this.screen}`);
+        ws.binaryType = 'arraybuffer';
+        this.ws = ws;
+
+        ws.onopen = () => {
+          if (!this.stale(gen)) this.setStatus('connecting', this.frames ? null : 'waiting for first frame…');
+          this.watchForStall();
+        };
+        ws.onerror = () => { if (!this.stale(gen)) this.setStatus('error', 'signaling unreachable'); };
+        ws.onclose = () => {
+          if (this.stale(gen)) return;
+          this.ws = null;
+          // Keep the decoder: a dropped socket does not invalidate the frames
+          // already drawn, and tearing it down is what made the page flicker.
+          this.retry = setTimeout(() => { this.retry = null; this.start(); }, this.retryDelay);
+          this.retryDelay = Math.min(this.retryDelay * 2, 10000);
+        };
+        ws.onmessage = (e) => {
+          if (this.stale(gen)) return;
+          if (e.data instanceof ArrayBuffer) return this.onFrame(e.data);
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { return; }
+          if (msg.type === 'video-init') this.configure(msg.codec, msg.width, msg.height);
+        };
+        this.retryDelay = 1000;
+      }
+
+      stop(message) {
+        clearTimeout(this.retry);
+        clearTimeout(this.stallTimer);
+        this.retry = null;
+        this.retryDelay = 1000;
+        this.generation++;           // orphan any socket still in flight
+        if (this.ws) { try { this.ws.close(); } catch {} this.ws = null; }
+        this.closeDecoder();
+        this.setStatus('error', message);
+      }
+
+      stale(gen) { return gen !== this.generation || tiles.get(this.key) !== this; }
+
+      closeDecoder() {
+        if (this.decoder) { try { this.decoder.close(); } catch {} this.decoder = null; }
+        this.awaitingKeyframe = true;
+      }
+
+      configure(codec, width, height) {
+        if (typeof VideoDecoder === 'undefined') {
+          this.setStatus('error', 'no WebCodecs in this browser');
+          return;
+        }
+        if (this.decoder && this.decoder.state === 'configured' &&
+            this.canvas.width === width && this.canvas.height === height) {
+          this.awaitingKeyframe = true;
+          this.send({ type: 'request-keyframe' });
+          return;
+        }
+        this.codec = codec;
+        this.softwareDecoder = false;
+        this.closeDecoder();
+        this.canvas.width = width;
+        this.canvas.height = height;
+        this.decoder = this.makeDecoder();
+        this.decoder.configure({
+          codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware'
+        });
+        this.awaitingKeyframe = true;
+      }
+
+      makeDecoder() {
+        const tile = this;
+        return new VideoDecoder({
+          output: (frame) => {
+            // Safari drops frames fast if we hold them; draw and release.
+            try { tile.ctx.drawImage(frame, 0, 0, tile.canvas.width, tile.canvas.height); }
+            finally { frame.close(); }
+            tile.countFrame();
+            // Clear the error as soon as frames flow again — a stale "decoder
+            // error" on a tile that is actually streaming is worse than no label.
+            if (tile.dot.className.includes('error') || tile.frames === 1) {
+              tile.setStatus('streaming', null);
+            }
+          },
+          error: () => {
+            // A headless browser, a VM or a remote session has no usable
+            // hardware decoder. Retrying without the hint lets the browser fall
+            // back to software rather than failing forever.
+            if (!tile.softwareDecoder && tile.codec) {
+              tile.softwareDecoder = true;
+              tile.closeDecoder();
+              tile.decoder = tile.makeDecoder();
+              tile.decoder.configure({ codec: tile.codec, optimizeForLatency: true });
+              tile.awaitingKeyframe = true;
+              tile.setStatus('connecting', null);
+              tile.send({ type: 'request-keyframe' });
+              return;
+            }
+            tile.setStatus('error', 'decoder error');
+            tile.awaitingKeyframe = true;
+            tile.send({ type: 'request-keyframe' });
+          }
+        });
+      }
+
+      onFrame(buf) {
+        if (!this.decoder || this.decoder.state !== 'configured') return;
+        const view = new DataView(buf);
+        const isKey = view.getUint8(0) === 0x01;
+        const pts = view.getUint32(1) * 4294967296 + view.getUint32(5);
+        if (this.awaitingKeyframe) {
+          if (!isKey) return;
+          this.awaitingKeyframe = false;
+        }
+        try {
+          this.decoder.decode(new EncodedVideoChunk({
+            type: isKey ? 'key' : 'delta',
+            timestamp: pts,
+            data: new Uint8Array(buf, 9)
+          }));
+        } catch {
+          this.awaitingKeyframe = true;
+          this.send({ type: 'request-keyframe' });
+        }
+      }
+
+      countFrame() {
+        this.frames++;
+        const now = performance.now();
+        this.fpsWindow.push(now);
+        while (this.fpsWindow.length && now - this.fpsWindow[0] > 1000) this.fpsWindow.shift();
+        this.fpsEl.textContent = this.fpsWindow.length + ' fps';
+        // SCStream only delivers on change, so a still screen sends nothing —
+        // but if we are waiting on a keyframe and nothing arrives, ask again
+        // rather than sit on a black tile.
+        this.lastFrameAt = now;
+        if (this.awaitingKeyframe) this.send({ type: 'request-keyframe' });
+      }
+
+      /// Nudge the server for a keyframe when the socket is open but nothing is
+      /// being drawn. Cheap insurance against a decoder that missed the first
+      /// one, which is otherwise unrecoverable until the encoder's next natural
+      /// GOP boundary.
+      watchForStall() {
+        clearTimeout(this.stallTimer);
+        this.stallTimer = setTimeout(() => {
+          if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+          if (this.frames > 0 && performance.now() - (this.lastFrameAt || 0) < 2000) {
+            this.watchForStall();
+            return;
+          }
+          this.awaitingKeyframe = true;
+          this.send({ type: 'request-keyframe' });
+          this.watchForStall();
+        }, 2000);
+      }
+
+      send(obj) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(obj));
+        }
+      }
+
+      destroy() {
+        tiles.delete(this.key);
+        this.stop('removed');
+        if (this.drag) {
+          if (packery && packery.unbindDraggabillyEvents) packery.unbindDraggabillyEvents(this.drag);
+          this.drag.destroy();
+        }
+        if (packery) packery.remove(this.el);
+        this.el.remove();
+      }
+    }
+
+    // ─── Dashboard sync ───────────────────────────────────────────────────────
+    async function refresh() {
+      let devices;
+      try {
+        devices = await (await fetch('/api/devices', { cache: 'no-store' })).json();
+      } catch {
+        return; // server restarting; next tick picks it up
+      }
+      if (!Array.isArray(devices)) return;
+
+      countEl.textContent = devices.length === 1 ? '1 device' : `${devices.length} devices`;
+      emptyEl.style.display = devices.length ? 'none' : 'block';
+
+      for (const d of devices) {
+        const tile = tiles.get(d.key);
+        if (tile) tile.apply(d);
+        else new Tile(d);
+      }
+      for (const [key, tile] of tiles) {
+        if (!devices.some((d) => d.key === key)) tile.destroy();
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

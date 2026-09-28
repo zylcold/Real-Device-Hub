@@ -1,0 +1,75 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (macOS ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # arm64 is the common developer machine; x86_64 covers Intel Macs.
+        runner: [macos-15, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Release build
+        run: swift build -c release
+
+      - name: Self test
+        # The pairing and cropping rules are the part that can break silently.
+        run: ./.build/release/RealDeviceHub --selftest
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist/pkg/bin dist/pkg/share/real-device-hub
+          cp .build/release/RealDeviceHub dist/pkg/bin/real-device-hub
+          cp -R browser dist/pkg/share/real-device-hub/browser
+          cp README.md dist/pkg/
+          tar -C dist/pkg -czf "real-device-hub-${{ matrix.runner }}.tar.gz" .
+          echo "sha256  $(shasum -a 256 "real-device-hub-${{ matrix.runner }}.tar.gz" | cut -d' ' -f1)  real-device-hub-${{ matrix.runner }}.tar.gz" > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-device-hub-${{ matrix.runner }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          retention-days: 14
+
+  smoke:
+    name: Serve without a display
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift build -c release
+      # A runner has no Simulator windows and no window server session, so this
+      # only proves the server, the CLI and the page come up — not the capture.
+      - name: Start, probe, stop
+        run: |
+          set -euo pipefail
+          ./.build/release/RealDeviceHub start --port 3801 --no-open
+          ./.build/release/RealDeviceHub status
+          curl -fsS http://localhost:3801/            | grep -q 'Real Device Hub'
+          curl -fsS http://localhost:3801/api/devices | grep -q '^\[\]$'
+          curl -fsS http://localhost:3801/vendor/packery.pkgd.js    | grep -q 'Packery'
+          curl -fsS http://localhost:3801/vendor/draggabilly.pkgd.js | grep -q 'Draggabilly'
+          ./.build/release/RealDeviceHub stop
+          ./.build/release/RealDeviceHub status || echo "stopped cleanly"
